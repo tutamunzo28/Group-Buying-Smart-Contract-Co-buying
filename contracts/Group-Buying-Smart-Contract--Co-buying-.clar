@@ -313,3 +313,294 @@
         ERR_CAMPAIGN_NOT_FOUND
     )
 )
+(define-map pricing-tiers
+    {
+        campaign-id: uint,
+        tier-level: uint,
+    }
+    {
+        min-participants: uint,
+        discount-price: uint,
+    }
+)
+
+(define-read-only (get-pricing-tier
+        (campaign-id uint)
+        (tier-level uint)
+    )
+    (map-get? pricing-tiers {
+        campaign-id: campaign-id,
+        tier-level: tier-level,
+    })
+)
+
+(define-read-only (get-current-discount-price (campaign-id uint))
+    (match (get-campaign campaign-id)
+        campaign (let (
+                (participant-count (get participant-count campaign))
+                (base-discount (get discount-price campaign))
+                (result (fold check-tier-discount (list u1 u2 u3 u4 u5) {
+                    campaign-id: campaign-id,
+                    participant-count: participant-count,
+                    current-price: base-discount,
+                }))
+            )
+            (get current-price result)
+        )
+        u0
+    )
+)
+
+(define-private (check-tier-discount
+        (tier-level uint)
+        (context {
+            campaign-id: uint,
+            participant-count: uint,
+            current-price: uint,
+        })
+    )
+    (match (get-pricing-tier (get campaign-id context) tier-level)
+        tier (if (>= (get participant-count context) (get min-participants tier))
+            (merge context { current-price: (get discount-price tier) })
+            context
+        )
+        context
+    )
+)
+
+(define-public (add-pricing-tier
+        (campaign-id uint)
+        (tier-level uint)
+        (min-participants uint)
+        (discount-price uint)
+    )
+    (let ((campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (> min-participants u0) ERR_INVALID_PARAMETERS)
+        (asserts! (> discount-price u0) ERR_INVALID_PARAMETERS)
+        (asserts! (< discount-price (get price-per-unit campaign))
+            ERR_INVALID_PARAMETERS
+        )
+        (asserts! (<= tier-level u5) ERR_INVALID_PARAMETERS)
+        (map-set pricing-tiers {
+            campaign-id: campaign-id,
+            tier-level: tier-level,
+        } {
+            min-participants: min-participants,
+            discount-price: discount-price,
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-all-pricing-tiers (campaign-id uint))
+    (let (
+            (tier1 (get-pricing-tier campaign-id u1))
+            (tier2 (get-pricing-tier campaign-id u2))
+            (tier3 (get-pricing-tier campaign-id u3))
+            (tier4 (get-pricing-tier campaign-id u4))
+            (tier5 (get-pricing-tier campaign-id u5))
+        )
+        (ok {
+            tier-1: tier1,
+            tier-2: tier2,
+            tier-3: tier3,
+            tier-4: tier4,
+            tier-5: tier5,
+        })
+    )
+)
+(define-constant DEFAULT_REFERRAL_RATE u5)
+
+(define-map referrals
+    {
+        campaign-id: uint,
+        referred-user: principal,
+    }
+    {
+        referrer: principal,
+        reward-amount: uint,
+        is-claimed: bool,
+    }
+)
+
+(define-map campaign-referral-settings
+    uint
+    {
+        referral-rate: uint,
+        max-referral-reward: uint,
+        is-enabled: bool,
+    }
+)
+
+(define-map user-referral-stats
+    principal
+    {
+        total-referrals: uint,
+        total-rewards-earned: uint,
+        total-rewards-claimed: uint,
+    }
+)
+
+(define-read-only (get-referral-info
+        (campaign-id uint)
+        (referred-user principal)
+    )
+    (map-get? referrals {
+        campaign-id: campaign-id,
+        referred-user: referred-user,
+    })
+)
+
+(define-read-only (get-campaign-referral-settings (campaign-id uint))
+    (default-to {
+        referral-rate: DEFAULT_REFERRAL_RATE,
+        max-referral-reward: u1000000,
+        is-enabled: false,
+    }
+        (map-get? campaign-referral-settings campaign-id)
+    )
+)
+
+(define-read-only (get-user-referral-stats (user principal))
+    (default-to {
+        total-referrals: u0,
+        total-rewards-earned: u0,
+        total-rewards-claimed: u0,
+    }
+        (map-get? user-referral-stats user)
+    )
+)
+
+(define-public (enable-referral-system
+        (campaign-id uint)
+        (referral-rate uint)
+        (max-referral-reward uint)
+    )
+    (let ((campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (<= referral-rate u20) ERR_INVALID_PARAMETERS)
+        (asserts! (> max-referral-reward u0) ERR_INVALID_PARAMETERS)
+        (map-set campaign-referral-settings campaign-id {
+            referral-rate: referral-rate,
+            max-referral-reward: max-referral-reward,
+            is-enabled: true,
+        })
+        (ok true)
+    )
+)
+
+(define-public (participate-with-referral
+        (campaign-id uint)
+        (units uint)
+        (referrer principal)
+    )
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (referral-settings (get-campaign-referral-settings campaign-id))
+            (contribution-amount (* units (get discount-price campaign)))
+            (existing-participation (get-participation campaign-id tx-sender))
+        )
+        (asserts! (> units u0) ERR_INVALID_AMOUNT)
+        (asserts! (get is-active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (<= stacks-block-height (get end-block campaign))
+            ERR_CAMPAIGN_EXPIRED
+        )
+        (asserts! (not (get is-finalized campaign)) ERR_CAMPAIGN_FINALIZED)
+        (asserts! (is-none existing-participation) ERR_ALREADY_PARTICIPATED)
+        (asserts! (not (is-eq tx-sender referrer)) ERR_INVALID_PARAMETERS)
+        (asserts! (get is-enabled referral-settings) ERR_CAMPAIGN_NOT_ACTIVE)
+        (try! (stx-transfer? contribution-amount tx-sender (as-contract tx-sender)))
+        (map-set participants {
+            campaign-id: campaign-id,
+            participant: tx-sender,
+        } {
+            amount: contribution-amount,
+            units: units,
+        })
+        (map-set campaigns campaign-id
+            (merge campaign {
+                total-raised: (+ (get total-raised campaign) contribution-amount),
+                participant-count: (+ (get participant-count campaign) u1),
+            })
+        )
+        (let (
+                (calculated-reward (/ (* contribution-amount (get referral-rate referral-settings))
+                    u100
+                ))
+                (reward-amount (if (< calculated-reward
+                        (get max-referral-reward referral-settings)
+                    )
+                    calculated-reward
+                    (get max-referral-reward referral-settings)
+                ))
+            )
+            (map-set referrals {
+                campaign-id: campaign-id,
+                referred-user: tx-sender,
+            } {
+                referrer: referrer,
+                reward-amount: reward-amount,
+                is-claimed: false,
+            })
+            (update-referrer-stats referrer reward-amount)
+        )
+        (add-to-user-campaigns tx-sender campaign-id)
+        (ok true)
+    )
+)
+
+(define-private (update-referrer-stats
+        (referrer principal)
+        (reward-amount uint)
+    )
+    (let ((current-stats (get-user-referral-stats referrer)))
+        (map-set user-referral-stats referrer {
+            total-referrals: (+ (get total-referrals current-stats) u1),
+            total-rewards-earned: (+ (get total-rewards-earned current-stats) reward-amount),
+            total-rewards-claimed: (get total-rewards-claimed current-stats),
+        })
+    )
+)
+
+(define-public (claim-referral-reward
+        (campaign-id uint)
+        (referred-user principal)
+    )
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (referral-info (unwrap! (get-referral-info campaign-id referred-user)
+                ERR_NOT_AUTHORIZED
+            ))
+        )
+        (asserts! (is-eq tx-sender (get referrer referral-info))
+            ERR_NOT_AUTHORIZED
+        )
+        (asserts! (get is-finalized campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (is-campaign-successful campaign-id) ERR_MINIMUM_NOT_MET)
+        (asserts! (not (get is-claimed referral-info)) ERR_ALREADY_PARTICIPATED)
+        (map-set referrals {
+            campaign-id: campaign-id,
+            referred-user: referred-user,
+        }
+            (merge referral-info { is-claimed: true })
+        )
+        (let ((current-stats (get-user-referral-stats tx-sender)))
+            (map-set user-referral-stats tx-sender
+                (merge current-stats { total-rewards-claimed: (+ (get total-rewards-claimed current-stats)
+                    (get reward-amount referral-info)
+                ) }
+                ))
+        )
+        (try! (as-contract (stx-transfer? (get reward-amount referral-info) tx-sender tx-sender)))
+        (ok true)
+    )
+)
+
+(define-read-only (get-pending-referral-rewards (referrer principal))
+    (let ((stats (get-user-referral-stats referrer)))
+        (- (get total-rewards-earned stats) (get total-rewards-claimed stats))
+    )
+)
