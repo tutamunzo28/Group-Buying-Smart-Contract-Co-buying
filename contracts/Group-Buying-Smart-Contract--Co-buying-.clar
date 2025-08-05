@@ -189,6 +189,7 @@
                 participant-count: (+ (get participant-count campaign) u1),
             })
         )
+        (try! (check-and-trigger-milestones campaign-id))
         (add-to-user-campaigns tx-sender campaign-id)
         (ok true)
     )
@@ -526,6 +527,7 @@
                 participant-count: (+ (get participant-count campaign) u1),
             })
         )
+        (try! (check-and-trigger-milestones campaign-id))
         (let (
                 (calculated-reward (/ (* contribution-amount (get referral-rate referral-settings))
                     u100
@@ -602,5 +604,207 @@
 (define-read-only (get-pending-referral-rewards (referrer principal))
     (let ((stats (get-user-referral-stats referrer)))
         (- (get total-rewards-earned stats) (get total-rewards-claimed stats))
+    )
+)
+
+(define-map campaign-milestones
+    {
+        campaign-id: uint,
+        milestone-id: uint,
+    }
+    {
+        target-amount: uint,
+        reward-percentage: uint,
+        description: (string-ascii 100),
+        is-achieved: bool,
+        achievement-block: uint,
+    }
+)
+
+(define-map milestone-participants
+    {
+        campaign-id: uint,
+        milestone-id: uint,
+        participant: principal,
+    }
+    {
+        reward-amount: uint,
+        is-claimed: bool,
+    }
+)
+
+(define-read-only (get-milestone
+        (campaign-id uint)
+        (milestone-id uint)
+    )
+    (map-get? campaign-milestones {
+        campaign-id: campaign-id,
+        milestone-id: milestone-id,
+    })
+)
+
+(define-read-only (get-milestone-participation
+        (campaign-id uint)
+        (milestone-id uint)
+        (participant principal)
+    )
+    (map-get? milestone-participants {
+        campaign-id: campaign-id,
+        milestone-id: milestone-id,
+        participant: participant,
+    })
+)
+
+(define-read-only (get-achieved-milestones (campaign-id uint))
+    (let (
+            (milestone1 (get-milestone campaign-id u1))
+            (milestone2 (get-milestone campaign-id u2))
+            (milestone3 (get-milestone campaign-id u3))
+            (milestone4 (get-milestone campaign-id u4))
+            (milestone5 (get-milestone campaign-id u5))
+        )
+        (ok {
+            milestone-1: (if (is-some milestone1)
+                (get is-achieved (unwrap-panic milestone1))
+                false
+            ),
+            milestone-2: (if (is-some milestone2)
+                (get is-achieved (unwrap-panic milestone2))
+                false
+            ),
+            milestone-3: (if (is-some milestone3)
+                (get is-achieved (unwrap-panic milestone3))
+                false
+            ),
+            milestone-4: (if (is-some milestone4)
+                (get is-achieved (unwrap-panic milestone4))
+                false
+            ),
+            milestone-5: (if (is-some milestone5)
+                (get is-achieved (unwrap-panic milestone5))
+                false
+            ),
+        })
+    )
+)
+
+(define-read-only (calculate-milestone-reward
+        (campaign-id uint)
+        (milestone-id uint)
+        (participant principal)
+    )
+    (match (get-milestone campaign-id milestone-id)
+        milestone (match (get-participation campaign-id participant)
+            participation (let (
+                    (participant-contribution (get amount participation))
+                    (reward-rate (get reward-percentage milestone))
+                )
+                (/ (* participant-contribution reward-rate) u100)
+            )
+            u0
+        )
+        u0
+    )
+)
+
+(define-public (create-milestone
+        (campaign-id uint)
+        (milestone-id uint)
+        (target-amount uint)
+        (reward-percentage uint)
+        (description (string-ascii 100))
+    )
+    (let ((campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (not (get is-finalized campaign)) ERR_CAMPAIGN_FINALIZED)
+        (asserts! (> target-amount u0) ERR_INVALID_PARAMETERS)
+        (asserts! (<= target-amount (get target-amount campaign))
+            ERR_INVALID_PARAMETERS
+        )
+        (asserts! (<= reward-percentage u10) ERR_INVALID_PARAMETERS)
+        (asserts! (<= milestone-id u5) ERR_INVALID_PARAMETERS)
+        (map-set campaign-milestones {
+            campaign-id: campaign-id,
+            milestone-id: milestone-id,
+        } {
+            target-amount: target-amount,
+            reward-percentage: reward-percentage,
+            description: description,
+            is-achieved: false,
+            achievement-block: u0,
+        })
+        (ok true)
+    )
+)
+
+(define-private (check-and-trigger-milestones (campaign-id uint))
+    (let ((campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND)))
+        (fold check-milestone-achievement (list u1 u2 u3 u4 u5) {
+            campaign-id: campaign-id,
+            current-raised: (get total-raised campaign),
+        })
+        (ok true)
+    )
+)
+
+(define-private (check-milestone-achievement
+        (milestone-id uint)
+        (context {
+            campaign-id: uint,
+            current-raised: uint,
+        })
+    )
+    (match (get-milestone (get campaign-id context) milestone-id)
+        milestone (if (and
+                (not (get is-achieved milestone))
+                (>= (get current-raised context) (get target-amount milestone))
+            )
+            (begin
+                (map-set campaign-milestones {
+                    campaign-id: (get campaign-id context),
+                    milestone-id: milestone-id,
+                }
+                    (merge milestone {
+                        is-achieved: true,
+                        achievement-block: stacks-block-height,
+                    })
+                )
+                context
+            )
+            context
+        )
+        context
+    )
+)
+
+(define-public (claim-milestone-reward
+        (campaign-id uint)
+        (milestone-id uint)
+    )
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (milestone (unwrap! (get-milestone campaign-id milestone-id)
+                ERR_CAMPAIGN_NOT_FOUND
+            ))
+            (existing-claim (get-milestone-participation campaign-id milestone-id tx-sender))
+            (participation (unwrap! (get-participation campaign-id tx-sender) ERR_NOT_AUTHORIZED))
+        )
+        (asserts! (get is-finalized campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (get is-achieved milestone) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (is-none existing-claim) ERR_ALREADY_PARTICIPATED)
+        (let ((reward-amount (calculate-milestone-reward campaign-id milestone-id tx-sender)))
+            (asserts! (> reward-amount u0) ERR_INVALID_AMOUNT)
+            (map-set milestone-participants {
+                campaign-id: campaign-id,
+                milestone-id: milestone-id,
+                participant: tx-sender,
+            } {
+                reward-amount: reward-amount,
+                is-claimed: true,
+            })
+            (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
+            (ok reward-amount)
+        )
     )
 )
