@@ -10,6 +10,9 @@
 (define-constant ERR_CAMPAIGN_FINALIZED (err u108))
 (define-constant ERR_REFUND_FAILED (err u109))
 (define-constant ERR_INVALID_PARAMETERS (err u110))
+(define-constant ERR_INSUFFICIENT_INSURANCE (err u111))
+(define-constant ERR_INSURANCE_ALREADY_CLAIMED (err u112))
+(define-constant ERR_DELIVERY_NOT_FAILED (err u113))
 
 (define-data-var campaign-counter uint u0)
 
@@ -27,6 +30,9 @@
         participant-count: uint,
         is-active: bool,
         is-finalized: bool,
+        insurance-amount: uint,
+        delivery-deadline: uint,
+        delivery-confirmed: bool,
     }
 )
 
@@ -152,6 +158,9 @@
             participant-count: u0,
             is-active: true,
             is-finalized: false,
+            insurance-amount: u0,
+            delivery-deadline: (+ end-block u8640),
+            delivery-confirmed: false,
         })
         (var-set campaign-counter campaign-id)
         (add-to-user-campaigns tx-sender campaign-id)
@@ -806,5 +815,162 @@
             (try! (as-contract (stx-transfer? reward-amount tx-sender tx-sender)))
             (ok reward-amount)
         )
+    )
+)
+
+(define-map insurance-claims
+    {
+        campaign-id: uint,
+        participant: principal,
+    }
+    {
+        claim-amount: uint,
+        is-claimed: bool,
+    }
+)
+
+(define-read-only (get-insurance-claim
+        (campaign-id uint)
+        (participant principal)
+    )
+    (map-get? insurance-claims {
+        campaign-id: campaign-id,
+        participant: participant,
+    })
+)
+
+(define-read-only (calculate-insurance-payout
+        (campaign-id uint)
+        (participant principal)
+    )
+    (match (get-campaign campaign-id)
+        campaign (match (get-participation campaign-id participant)
+            participation (let (
+                    (total-insurance (get insurance-amount campaign))
+                    (total-raised (get total-raised campaign))
+                    (participant-contribution (get amount participation))
+                )
+                (if (and (> total-insurance u0) (> total-raised u0))
+                    (/ (* total-insurance participant-contribution) total-raised)
+                    u0
+                )
+            )
+            u0
+        )
+        u0
+    )
+)
+
+(define-read-only (is-delivery-failed (campaign-id uint))
+    (match (get-campaign campaign-id)
+        campaign (and
+            (get is-finalized campaign)
+            (not (get delivery-confirmed campaign))
+            (> stacks-block-height (get delivery-deadline campaign))
+        )
+        false
+    )
+)
+
+(define-public (deposit-insurance (campaign-id uint))
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (insurance-amount (/ (get target-amount campaign) u10))
+        )
+        (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (not (get is-finalized campaign)) ERR_CAMPAIGN_FINALIZED)
+        (asserts! (is-eq (get insurance-amount campaign) u0)
+            ERR_ALREADY_PARTICIPATED
+        )
+        (try! (stx-transfer? insurance-amount tx-sender (as-contract tx-sender)))
+        (map-set campaigns campaign-id
+            (merge campaign { insurance-amount: insurance-amount })
+        )
+        (ok insurance-amount)
+    )
+)
+
+(define-public (confirm-delivery (campaign-id uint))
+    (let ((campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-finalized campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (is-campaign-successful campaign-id) ERR_MINIMUM_NOT_MET)
+        (asserts! (not (get delivery-confirmed campaign))
+            ERR_ALREADY_PARTICIPATED
+        )
+        (asserts! (<= stacks-block-height (get delivery-deadline campaign))
+            ERR_CAMPAIGN_EXPIRED
+        )
+        (map-set campaigns campaign-id
+            (merge campaign { delivery-confirmed: true })
+        )
+        (if (> (get insurance-amount campaign) u0)
+            (begin
+                (try! (as-contract (stx-transfer? (get insurance-amount campaign) tx-sender
+                    (get creator campaign)
+                )))
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-insurance-payout (campaign-id uint))
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (existing-claim (get-insurance-claim campaign-id tx-sender))
+            (participation (unwrap! (get-participation campaign-id tx-sender) ERR_NOT_AUTHORIZED))
+            (payout-amount (calculate-insurance-payout campaign-id tx-sender))
+        )
+        (asserts! (get is-finalized campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (is-delivery-failed campaign-id) ERR_DELIVERY_NOT_FAILED)
+        (asserts! (is-none existing-claim) ERR_INSURANCE_ALREADY_CLAIMED)
+        (asserts! (> payout-amount u0) ERR_INSUFFICIENT_INSURANCE)
+        (map-set insurance-claims {
+            campaign-id: campaign-id,
+            participant: tx-sender,
+        } {
+            claim-amount: payout-amount,
+            is-claimed: true,
+        })
+        (try! (as-contract (stx-transfer? payout-amount tx-sender tx-sender)))
+        (ok payout-amount)
+    )
+)
+
+(define-public (extend-delivery-deadline
+        (campaign-id uint)
+        (additional-blocks uint)
+    )
+    (let ((campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-finalized campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (not (get delivery-confirmed campaign))
+            ERR_ALREADY_PARTICIPATED
+        )
+        (asserts! (> additional-blocks u0) ERR_INVALID_PARAMETERS)
+        (asserts! (<= additional-blocks u17520) ERR_INVALID_PARAMETERS)
+        (map-set campaigns campaign-id
+            (merge campaign { delivery-deadline: (+ (get delivery-deadline campaign) additional-blocks) })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-campaign-insurance-info (campaign-id uint))
+    (match (get-campaign campaign-id)
+        campaign (ok {
+            insurance-amount: (get insurance-amount campaign),
+            delivery-deadline: (get delivery-deadline campaign),
+            delivery-confirmed: (get delivery-confirmed campaign),
+            delivery-failed: (is-delivery-failed campaign-id),
+            blocks-until-deadline: (if (> (get delivery-deadline campaign) stacks-block-height)
+                (- (get delivery-deadline campaign) stacks-block-height)
+                u0
+            ),
+        })
+        ERR_CAMPAIGN_NOT_FOUND
     )
 )
