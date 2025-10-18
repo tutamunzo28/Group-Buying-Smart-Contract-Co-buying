@@ -13,6 +13,7 @@
 (define-constant ERR_INSUFFICIENT_INSURANCE (err u111))
 (define-constant ERR_INSURANCE_ALREADY_CLAIMED (err u112))
 (define-constant ERR_DELIVERY_NOT_FAILED (err u113))
+(define-constant ERR_EARLY_BIRD_EXHAUSTED (err u114))
 
 (define-data-var campaign-counter uint u0)
 
@@ -972,5 +973,186 @@
             ),
         })
         ERR_CAMPAIGN_NOT_FOUND
+    )
+)
+
+(define-map early-bird-settings
+    uint
+    {
+        max-slots: uint,
+        slots-claimed: uint,
+        bonus-percentage: uint,
+        is-enabled: bool,
+    }
+)
+
+(define-map early-bird-participants
+    {
+        campaign-id: uint,
+        participant: principal,
+    }
+    {
+        bonus-amount: uint,
+        is-claimed: bool,
+    }
+)
+
+(define-read-only (get-early-bird-settings (campaign-id uint))
+    (map-get? early-bird-settings campaign-id)
+)
+
+(define-read-only (get-early-bird-participation
+        (campaign-id uint)
+        (participant principal)
+    )
+    (map-get? early-bird-participants {
+        campaign-id: campaign-id,
+        participant: participant,
+    })
+)
+
+(define-read-only (is-early-bird-available (campaign-id uint))
+    (match (get-early-bird-settings campaign-id)
+        settings (and
+            (get is-enabled settings)
+            (< (get slots-claimed settings) (get max-slots settings))
+        )
+        false
+    )
+)
+
+(define-read-only (calculate-early-bird-bonus
+        (campaign-id uint)
+        (participant principal)
+    )
+    (match (get-early-bird-settings campaign-id)
+        settings (match (get-participation campaign-id participant)
+            participation (let (
+                    (contribution (get amount participation))
+                    (bonus-rate (get bonus-percentage settings))
+                )
+                (/ (* contribution bonus-rate) u100)
+            )
+            u0
+        )
+        u0
+    )
+)
+
+(define-public (enable-early-bird
+        (campaign-id uint)
+        (max-slots uint)
+        (bonus-percentage uint)
+    )
+    (let ((campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get creator campaign)) ERR_NOT_AUTHORIZED)
+        (asserts! (get is-active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (not (get is-finalized campaign)) ERR_CAMPAIGN_FINALIZED)
+        (asserts! (> max-slots u0) ERR_INVALID_PARAMETERS)
+        (asserts! (<= max-slots u50) ERR_INVALID_PARAMETERS)
+        (asserts! (> bonus-percentage u0) ERR_INVALID_PARAMETERS)
+        (asserts! (<= bonus-percentage u20) ERR_INVALID_PARAMETERS)
+        (map-set early-bird-settings campaign-id {
+            max-slots: max-slots,
+            slots-claimed: u0,
+            bonus-percentage: bonus-percentage,
+            is-enabled: true,
+        })
+        (ok true)
+    )
+)
+
+(define-private (register-early-bird-participant (campaign-id uint))
+    (match (get-early-bird-settings campaign-id)
+        settings (if (and
+                (get is-enabled settings)
+                (< (get slots-claimed settings) (get max-slots settings))
+            )
+            (begin
+                (map-set early-bird-settings campaign-id
+                    (merge settings { slots-claimed: (+ (get slots-claimed settings) u1) })
+                )
+                (ok true)
+            )
+            (ok false)
+        )
+        (ok false)
+    )
+)
+
+(define-public (claim-early-bird-bonus (campaign-id uint))
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (settings (unwrap! (get-early-bird-settings campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (existing-claim (get-early-bird-participation campaign-id tx-sender))
+            (participation (unwrap! (get-participation campaign-id tx-sender) ERR_NOT_AUTHORIZED))
+        )
+        (asserts! (get is-finalized campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (is-campaign-successful campaign-id) ERR_MINIMUM_NOT_MET)
+        (asserts! (is-none existing-claim) ERR_ALREADY_PARTICIPATED)
+        (let ((bonus-amount (calculate-early-bird-bonus campaign-id tx-sender)))
+            (asserts! (> bonus-amount u0) ERR_INVALID_AMOUNT)
+            (map-set early-bird-participants {
+                campaign-id: campaign-id,
+                participant: tx-sender,
+            } {
+                bonus-amount: bonus-amount,
+                is-claimed: true,
+            })
+            (try! (as-contract (stx-transfer? bonus-amount tx-sender tx-sender)))
+            (ok bonus-amount)
+        )
+    )
+)
+
+(define-read-only (get-early-bird-stats (campaign-id uint))
+    (match (get-early-bird-settings campaign-id)
+        settings (ok {
+            max-slots: (get max-slots settings),
+            slots-claimed: (get slots-claimed settings),
+            slots-remaining: (- (get max-slots settings) (get slots-claimed settings)),
+            bonus-percentage: (get bonus-percentage settings),
+            is-enabled: (get is-enabled settings),
+            is-available: (is-early-bird-available campaign-id),
+        })
+        ERR_CAMPAIGN_NOT_FOUND
+    )
+)
+
+(define-public (participate-as-early-bird
+        (campaign-id uint)
+        (units uint)
+    )
+    (let (
+            (campaign (unwrap! (get-campaign campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+            (contribution-amount (* units (get discount-price campaign)))
+            (existing-participation (get-participation campaign-id tx-sender))
+        )
+        (asserts! (> units u0) ERR_INVALID_AMOUNT)
+        (asserts! (get is-active campaign) ERR_CAMPAIGN_NOT_ACTIVE)
+        (asserts! (<= stacks-block-height (get end-block campaign))
+            ERR_CAMPAIGN_EXPIRED
+        )
+        (asserts! (not (get is-finalized campaign)) ERR_CAMPAIGN_FINALIZED)
+        (asserts! (is-none existing-participation) ERR_ALREADY_PARTICIPATED)
+        (asserts! (is-early-bird-available campaign-id) ERR_EARLY_BIRD_EXHAUSTED)
+        (try! (stx-transfer? contribution-amount tx-sender (as-contract tx-sender)))
+        (map-set participants {
+            campaign-id: campaign-id,
+            participant: tx-sender,
+        } {
+            amount: contribution-amount,
+            units: units,
+        })
+        (map-set campaigns campaign-id
+            (merge campaign {
+                total-raised: (+ (get total-raised campaign) contribution-amount),
+                participant-count: (+ (get participant-count campaign) u1),
+            })
+        )
+        (try! (check-and-trigger-milestones campaign-id))
+        (unwrap-panic (register-early-bird-participant campaign-id))
+        (add-to-user-campaigns tx-sender campaign-id)
+        (ok true)
     )
 )
