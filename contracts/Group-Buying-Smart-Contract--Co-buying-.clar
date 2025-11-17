@@ -1156,3 +1156,58 @@
         (ok true)
     )
 )
+
+(define-private (build-user-dashboard-entry
+        (campaign-id uint)
+        (context {
+            user: principal,
+            items: (list 50
+                {
+                campaign-id: uint,
+                is-active: bool,
+                is-finalized: bool,
+                is-successful: bool,
+                total-contribution: uint,
+            }),
+        })
+    )
+    (match (get-campaign campaign-id)
+        campaign (let (
+                (user (get user context))
+                (participation (get-participation campaign-id user))
+                (is-successful (and
+                    (>= (get total-raised campaign) (get target-amount campaign))
+                    (>= (get participant-count campaign)
+                        (get min-participants campaign)
+                    )
+                ))
+                (contribution (match participation
+                    p (get amount p)
+                    u0
+                ))
+                (entry {
+                    campaign-id: campaign-id,
+                    is-active: (get is-active campaign),
+                    is-finalized: (get is-finalized campaign),
+                    is-successful: is-successful,
+                    total-contribution: contribution,
+                })
+            )
+            (merge context { items: (unwrap-panic (as-max-len? (append (get items context) entry) u50)) })
+        )
+        context
+    )
+)
+
+(define-read-only (get-user-dashboard (user principal))
+    (let (
+            (campaign-ids (get-user-campaigns user))
+            (initial {
+                user: user,
+                items: (list),
+            })
+            (result (fold build-user-dashboard-entry campaign-ids initial))
+        )
+        (ok (get items result))
+    )
+)
